@@ -1,0 +1,124 @@
+name: Announce release to Discord
+
+# Posts every STABLE Mote release to the Mote Discord #updates channel.
+#
+#   release: published  -> automatic, pings @everyone (hotfixes included)
+#   workflow_dispatch   -> manual: dry run (default), real send, silent send,
+#                          or a short self-deleting connectivity probe
+#
+# Beta / RC / draft releases are skipped by the script, not by this file.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "What to do"
+        type: choice
+        default: dry_run
+        options:
+          - dry_run          # render the messages into the log, post nothing
+          - test_connection  # post a short silent note, then delete it
+          - send_silent      # post the real notes, no @everyone ping, no receipt
+          - send             # post the real notes and ping @everyone
+      tag:
+        description: "Release tag (e.g. v1.5.6.1). Required unless mode=test_connection."
+        required: false
+        type: string
+
+permissions:
+  contents: read   # read the release; the script never writes to the repo
+  actions: read    # read run artifacts for the duplicate-send check
+
+concurrency:
+  # One announce at a time per release, so a re-run cannot interleave messages.
+  group: discord-announce-${{ github.event.release.tag_name || inputs.tag || 'manual' }}
+  cancel-in-progress: false
+
+jobs:
+  announce:
+    runs-on: ubuntu-latest   # python3 is preinstalled; no setup-python needed
+    steps:
+      - name: Check out the announcer
+        uses: actions/checkout@v4   # official action, pinned to the v4 major
+        with:
+          persist-credentials: false
+
+      - name: Resolve mode
+        id: cfg
+        env:
+          MODE: ${{ github.event_name == 'release' && 'send' || inputs.mode }}
+          TAG: ${{ inputs.tag }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          case "$MODE" in
+            dry_run)         FLAGS="--dry-run" ;;
+            test_connection) FLAGS="--test-connection" ;;
+            send_silent)     FLAGS="--no-ping" ;;
+            send)            FLAGS="" ;;
+            *) echo "unknown mode: $MODE" >&2; exit 1 ;;
+          esac
+          if [ "$MODE" != "test_connection" ] && [ "$EVENT" != "release" ] && [ -z "$TAG" ]; then
+            echo "mode=$MODE needs a tag input" >&2
+            exit 1
+          fi
+          echo "mode=$MODE"   >> "$GITHUB_OUTPUT"
+          echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
+
+      # The release event payload already carries the whole release object, so
+      # the automatic path makes no GitHub API call for it.
+      - name: Announce (release published)
+        if: github.event_name == 'release'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_UPDATES_WEBHOOK }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/announce_release.py \
+            --event-path "$GITHUB_EVENT_PATH" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dedup-prefix "discord-receipt-" \
+            --receipt receipt.json
+
+      - name: Connectivity probe (manual)
+        if: github.event_name == 'workflow_dispatch' && steps.cfg.outputs.mode == 'test_connection'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_UPDATES_WEBHOOK }}
+        run: python3 scripts/announce_release.py --test-connection
+
+      - name: Announce (manual tag)
+        if: github.event_name == 'workflow_dispatch' && steps.cfg.outputs.mode != 'test_connection'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_UPDATES_WEBHOOK }}
+          GITHUB_TOKEN: ${{ github.token }}
+          FLAGS: ${{ steps.cfg.outputs.flags }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          python3 scripts/announce_release.py \
+            --repo "$GITHUB_REPOSITORY" \
+            --tag "$TAG" \
+            --dedup-prefix "discord-receipt-" \
+            --receipt receipt.json $FLAGS
+
+      # The receipt IS the duplicate-send marker: the next run's --dedup-prefix
+      # check looks for an artifact with this name. Nothing is written to the repo.
+      - name: Read receipt name
+        id: receipt
+        if: hashFiles('receipt.json') != ''
+        run: |
+          set -euo pipefail
+          NAME=$(python3 -c "import json;print(json.load(open('receipt.json'))['artifact_name'])")
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload delivery receipt
+        if: steps.receipt.outputs.name != ''
+        uses: actions/upload-artifact@v4   # official action, pinned to the v4 major
+        with:
+          name: ${{ steps.receipt.outputs.name }}
+          path: receipt.json
+          retention-days: 90
+          if-no-files-found: ignore
